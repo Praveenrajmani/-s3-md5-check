@@ -18,6 +18,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/md5"
 	"flag"
@@ -26,6 +27,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -35,11 +37,15 @@ import (
 
 var (
 	endpoint, accessKey, secretKey string
-	bucket, prefix                 string
+	bucket, prefix, targetDir      string
 	debug                          bool
 	versions                       bool
 	insecure                       bool
 	corruptedOnly                  bool
+)
+
+const (
+	targetFileName = "objectsinfo.txt"
 )
 
 // getMD5Sum returns MD5 sum of given data.
@@ -59,6 +65,7 @@ func main() {
 	flag.BoolVar(&versions, "versions", false, "Verify all versions")
 	flag.BoolVar(&insecure, "insecure", false, "Disable TLS verification")
 	flag.BoolVar(&corruptedOnly, "corrupted-only", false, "display corrupted entries only")
+	flag.StringVar(&targetDir, "target-dir", "", fmt.Sprintf("Select a target directory to create the result file (%s)", targetFileName))
 	flag.Parse()
 
 	if endpoint == "" {
@@ -101,6 +108,15 @@ func main() {
 		log.Fatalln(err)
 	}
 
+	f, err := os.OpenFile(filepath.Join(targetDir, targetFileName), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		log.Fatalln("Could not open file path", filepath.Join(targetDir, targetFileName), err)
+	}
+	defer f.Close()
+
+	datawriter := bufio.NewWriter(f)
+	defer datawriter.Flush()
+
 	if debug {
 		s3Client.TraceOn(os.Stderr)
 	}
@@ -129,7 +145,7 @@ func main() {
 		// List all objects from a bucket-name with a matching prefix.
 		for object := range s3Client.ListObjects(context.Background(), bucket, opts) {
 			if object.Err != nil {
-				log.Fatalln("LIST error:", object.Err)
+				log.Println("LIST error:", object.Err)
 				continue
 			}
 			if object.IsDeleteMarker {
@@ -151,12 +167,12 @@ func main() {
 				if p, err := strconv.Atoi(s[1]); err == nil {
 					parts = p
 				} else {
-					log.Fatalln("ETAG: wrong format:", err)
+					log.Println("ETAG: wrong format:", err)
 					continue
 				}
 				multipart = true
 			default:
-				log.Fatalln("Unexpected ETAG format", object.ETag)
+				log.Println("Unexpected ETAG format", object.ETag)
 				continue
 			}
 
@@ -168,12 +184,12 @@ func main() {
 				}
 				obj, err := s3Client.GetObject(context.Background(), bucket, object.Key, opts)
 				if err != nil {
-					log.Fatalln("GET", bucket, object.Key, object.VersionID, "=>", err)
+					log.Println("GET", bucket, object.Key, object.VersionID, "=>", err)
 					continue
 				}
 				h := md5.New()
 				if _, err := io.Copy(h, obj); err != nil {
-					log.Fatalln("MD5 calculation error:", bucket, object.Key, object.VersionID, "=>", err)
+					log.Println("MD5 calculation error:", bucket, object.Key, object.VersionID, "=>", err)
 					continue
 				}
 				partsMD5Sum = append(partsMD5Sum, h.Sum(nil))
@@ -203,11 +219,17 @@ func main() {
 				return versionID
 			}
 
+			var str string
 			if corrupted {
-				fmt.Printf("%s, %s, %s, %t\n", bucket, object.Key, getNonEmptyVersionID(object.VersionID), object.IsDeleteMarker)
+				str = fmt.Sprintf("%s, %s, %s, %t\n", bucket, object.Key, getNonEmptyVersionID(object.VersionID), object.IsDeleteMarker)
 			} else {
 				if !corruptedOnly {
-					fmt.Printf("%s, %s, %s, %t\n", bucket, object.Key, getNonEmptyVersionID(object.VersionID), object.IsDeleteMarker)
+					str = fmt.Sprintf("%s, %s, %s, %t\n", bucket, object.Key, getNonEmptyVersionID(object.VersionID), object.IsDeleteMarker)
+				}
+			}
+			if str != "" {
+				if _, err := datawriter.WriteString(str); err != nil {
+					log.Println("Error writing object to file:", bucket, object.Key, object.VersionID, err)
 				}
 			}
 		}
