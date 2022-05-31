@@ -21,6 +21,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/md5"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -35,6 +36,22 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
+type buckets []string
+
+func (bs *buckets) String() string {
+	return fmt.Sprint(*bs)
+}
+
+func (bs *buckets) Set(value string) error {
+	if len(*bs) > 0 {
+		return errors.New("interval flag already set")
+	}
+	for _, b := range strings.Split(value, ",") {
+		*bs = append(*bs, b)
+	}
+	return nil
+}
+
 var (
 	endpoint, accessKey, secretKey string
 	bucket, prefix, targetDir      string
@@ -42,6 +59,7 @@ var (
 	versions                       bool
 	insecure                       bool
 	corruptedOnly                  bool
+	selectedBuckets                buckets
 )
 
 const (
@@ -67,7 +85,7 @@ func main() {
 	flag.StringVar(&endpoint, "endpoint", "https://play.min.io", "S3 endpoint URL")
 	flag.StringVar(&accessKey, "access-key", "Q3AM3UQ867SPQQA43P2F", "S3 Access Key")
 	flag.StringVar(&secretKey, "secret-key", "zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG", "S3 Secret Key")
-	flag.StringVar(&bucket, "bucket", "", "Select a specific bucket")
+	flag.Var(&selectedBuckets, "buckets", "comma-separated list of buckets")
 	flag.StringVar(&prefix, "prefix", "", "Select a prefix")
 	flag.BoolVar(&debug, "debug", false, "Prints HTTP network calls to S3 endpoint")
 	flag.BoolVar(&versions, "versions", false, "Verify all versions")
@@ -130,8 +148,8 @@ func main() {
 	}
 
 	var buckets []string
-	if bucket != "" {
-		buckets = append(buckets, bucket)
+	if len(selectedBuckets) > 0 {
+		buckets = append(buckets, selectedBuckets...)
 	} else {
 		bucketsInfo, err := s3Client.ListBuckets(context.Background())
 		if err != nil {
@@ -153,7 +171,7 @@ func main() {
 		// List all objects from a bucket-name with a matching prefix.
 		for object := range s3Client.ListObjects(context.Background(), bucket, opts) {
 			if object.Err != nil {
-				log.Println("LIST error:", object.Err)
+				log.Println("LIST error: ", bucket, object.Err)
 				continue
 			}
 			if object.IsDeleteMarker {
