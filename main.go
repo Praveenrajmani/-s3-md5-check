@@ -55,6 +55,14 @@ func getMD5Sum(data []byte) []byte {
 	return hash.Sum(nil)
 }
 
+// getNonEmptyVersionID sanitizes the versionID string
+func getNonEmptyVersionID(versionID string) string {
+	if versionID == "" {
+		return "null"
+	}
+	return versionID
+}
+
 func main() {
 	flag.StringVar(&endpoint, "endpoint", "https://play.min.io", "S3 endpoint URL")
 	flag.StringVar(&accessKey, "access-key", "Q3AM3UQ867SPQQA43P2F", "S3 Access Key")
@@ -177,6 +185,8 @@ func main() {
 			}
 
 			var partsMD5Sum [][]byte
+			var failedMD5 bool
+			var str string
 			for p := 1; p <= parts; p++ {
 				opts := minio.GetObjectOptions{
 					VersionID:  object.VersionID,
@@ -185,14 +195,24 @@ func main() {
 				obj, err := s3Client.GetObject(context.Background(), bucket, object.Key, opts)
 				if err != nil {
 					log.Println("GET", bucket, object.Key, object.VersionID, "=>", err)
-					continue
+					failedMD5 = true
+					break
 				}
 				h := md5.New()
 				if _, err := io.Copy(h, obj); err != nil {
 					log.Println("MD5 calculation error:", bucket, object.Key, object.VersionID, "=>", err)
-					continue
+					failedMD5 = true
+					break
 				}
 				partsMD5Sum = append(partsMD5Sum, h.Sum(nil))
+			}
+
+			if failedMD5 {
+				str = fmt.Sprintf("%s, %s, %s, %t\n", bucket, object.Key, getNonEmptyVersionID(object.VersionID), object.IsDeleteMarker)
+				if _, err := datawriter.WriteString(str); err != nil {
+					log.Println("Error writing object to file:", bucket, object.Key, object.VersionID, err)
+				}
+				continue
 			}
 
 			corrupted := false
@@ -212,14 +232,6 @@ func main() {
 				}
 			}
 
-			getNonEmptyVersionID := func(versionID string) string {
-				if versionID == "" {
-					return "null"
-				}
-				return versionID
-			}
-
-			var str string
 			if corrupted {
 				str = fmt.Sprintf("%s, %s, %s, %t\n", bucket, object.Key, getNonEmptyVersionID(object.VersionID), object.IsDeleteMarker)
 			} else {
