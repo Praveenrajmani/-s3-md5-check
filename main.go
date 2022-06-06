@@ -136,6 +136,12 @@ func main() {
 		log.Fatalln(err)
 	}
 
+	if inputFile != "" {
+		if filepath.Base(inputFile) == targetFileName {
+			log.Fatal("both the input and target file cannot have same filenames, please rename the input file")
+		}
+	}
+
 	f, err := os.OpenFile(filepath.Join(targetDir, targetFileName), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		log.Fatalln("Could not open file path", filepath.Join(targetDir, targetFileName), err)
@@ -155,10 +161,6 @@ func main() {
 			log.Fatal("Unable to read input file "+inputFile, err)
 		}
 		defer csvf.Close()
-
-		if csvf.Name() == f.Name() {
-			log.Fatal("both the input and target file cannot have same filenames, please rename the input file")
-		}
 
 		lines, err := csv.NewReader(csvf).ReadAll()
 		if err != nil {
