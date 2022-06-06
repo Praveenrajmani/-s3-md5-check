@@ -137,7 +137,15 @@ func main() {
 	}
 
 	if inputFile != "" {
-		if filepath.Base(inputFile) == targetFileName {
+		inputFileAbs, err := filepath.Abs(inputFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		targetFileAbs, err := filepath.Abs(filepath.Join(targetDir, targetFileName))
+		if err != nil {
+			log.Fatal(err)
+		}
+		if inputFileAbs == targetFileAbs {
 			log.Fatal("both the input and target file cannot have same filenames, please rename the input file")
 		}
 	}
