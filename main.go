@@ -21,6 +21,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/md5"
+	"encoding/csv"
 	"errors"
 	"flag"
 	"fmt"
@@ -53,13 +54,13 @@ func (bs *buckets) Set(value string) error {
 }
 
 var (
-	endpoint, accessKey, secretKey string
-	bucket, prefix, targetDir      string
-	debug                          bool
-	versions                       bool
-	insecure                       bool
-	corruptedOnly                  bool
-	selectedBuckets                buckets
+	endpoint, accessKey, secretKey       string
+	bucket, prefix, targetDir, inputFile string
+	debug                                bool
+	versions                             bool
+	insecure                             bool
+	corruptedOnly                        bool
+	selectedBuckets                      buckets
 )
 
 const (
@@ -92,6 +93,7 @@ func main() {
 	flag.BoolVar(&insecure, "insecure", false, "Disable TLS verification")
 	flag.BoolVar(&corruptedOnly, "corrupted-only", false, "display corrupted entries only")
 	flag.StringVar(&targetDir, "target-dir", "", fmt.Sprintf("Select a target directory to create the result file (%s)", targetFileName))
+	flag.StringVar(&inputFile, "input-file", "", "select a input file which has the csv entries to be checked")
 	flag.Parse()
 
 	if endpoint == "" {
@@ -147,6 +149,45 @@ func main() {
 		s3Client.TraceOn(os.Stderr)
 	}
 
+	if inputFile != "" {
+		csvf, err := os.Open(inputFile)
+		if err != nil {
+			log.Fatal("Unable to read input file "+inputFile, err)
+		}
+		defer csvf.Close()
+
+		if csvf.Name() == f.Name() {
+			log.Fatal("both the input and target file cannot have same filenames, please rename the input file")
+		}
+
+		lines, err := csv.NewReader(csvf).ReadAll()
+		if err != nil {
+			log.Fatal("Unable to parse file as CSV for "+inputFile, err)
+		}
+		for _, line := range lines {
+			bucketName := strings.TrimSpace(line[0])
+			objectName := strings.TrimSpace(line[1])
+			versionID := ""
+			if len(line) > 2 && versions {
+				versionID = strings.TrimSpace(line[2])
+			}
+			object, err := s3Client.GetObject(context.Background(), bucketName, objectName, minio.GetObjectOptions{
+				VersionID: versionID,
+			})
+			if err != nil {
+				log.Println("GetObject error: ", bucket, object, versionID, err)
+				continue
+			}
+			objInfo, err := object.Stat()
+			if err != nil {
+				log.Println("StatObject error: ", bucket, object, versionID, err)
+				continue
+			}
+			checkMD5(s3Client, bucketName, objInfo, datawriter)
+		}
+		return
+	}
+
 	var buckets []string
 	if len(selectedBuckets) > 0 {
 		buckets = append(buckets, selectedBuckets...)
@@ -170,98 +211,102 @@ func main() {
 
 		// List all objects from a bucket-name with a matching prefix.
 		for object := range s3Client.ListObjects(context.Background(), bucket, opts) {
-			if object.Err != nil {
-				log.Println("LIST error: ", bucket, object.Err)
-				continue
-			}
-			if object.IsDeleteMarker {
-				continue
-			}
-			if _, ok := object.UserMetadata["X-Amz-Server-Side-Encryption-Customer-Algorithm"]; ok {
-				continue
-			}
-			if v, ok := object.UserMetadata["X-Amz-Server-Side-Encryption"]; ok && v == "aws:kms" {
-				continue
-			}
-			parts := 1
-			multipart := false
-			s := strings.Split(object.ETag, "-")
-			switch len(s) {
-			case 1:
-				// nothing to do
-			case 2:
-				if p, err := strconv.Atoi(s[1]); err == nil {
-					parts = p
-				} else {
-					log.Println("ETAG: wrong format:", err)
-					continue
-				}
-				multipart = true
-			default:
-				log.Println("Unexpected ETAG format", object.ETag)
-				continue
-			}
+			checkMD5(s3Client, bucket, object, datawriter)
+		}
+	}
+}
 
-			var partsMD5Sum [][]byte
-			var failedMD5 bool
-			var str string
-			for p := 1; p <= parts; p++ {
-				opts := minio.GetObjectOptions{
-					VersionID:  object.VersionID,
-					PartNumber: p,
-				}
-				obj, err := s3Client.GetObject(context.Background(), bucket, object.Key, opts)
-				if err != nil {
-					log.Println("GET", bucket, object.Key, object.VersionID, "=>", err)
-					failedMD5 = true
-					break
-				}
-				h := md5.New()
-				if _, err := io.Copy(h, obj); err != nil {
-					log.Println("MD5 calculation error:", bucket, object.Key, object.VersionID, "=>", err)
-					failedMD5 = true
-					break
-				}
-				partsMD5Sum = append(partsMD5Sum, h.Sum(nil))
-			}
+func checkMD5(s3Client *minio.Client, bucket string, object minio.ObjectInfo, datawriter *bufio.Writer) {
+	if object.Err != nil {
+		log.Println("LIST error: ", bucket, object.Err)
+		return
+	}
+	if object.IsDeleteMarker {
+		return
+	}
+	if _, ok := object.UserMetadata["X-Amz-Server-Side-Encryption-Customer-Algorithm"]; ok {
+		return
+	}
+	if v, ok := object.UserMetadata["X-Amz-Server-Side-Encryption"]; ok && v == "aws:kms" {
+		return
+	}
+	parts := 1
+	multipart := false
+	s := strings.Split(object.ETag, "-")
+	switch len(s) {
+	case 1:
+		// nothing to do
+	case 2:
+		if p, err := strconv.Atoi(s[1]); err == nil {
+			parts = p
+		} else {
+			log.Println("ETAG: wrong format:", err)
+			return
+		}
+		multipart = true
+	default:
+		log.Println("Unexpected ETAG format", object.ETag)
+		return
+	}
 
-			if failedMD5 {
-				str = fmt.Sprintf("%s, %s, %s, %t\n", bucket, object.Key, getNonEmptyVersionID(object.VersionID), object.IsDeleteMarker)
-				if _, err := datawriter.WriteString(str); err != nil {
-					log.Println("Error writing object to file:", bucket, object.Key, object.VersionID, err)
-				}
-				continue
-			}
+	var partsMD5Sum [][]byte
+	var failedMD5 bool
+	var str string
+	for p := 1; p <= parts; p++ {
+		opts := minio.GetObjectOptions{
+			VersionID:  object.VersionID,
+			PartNumber: p,
+		}
+		obj, err := s3Client.GetObject(context.Background(), bucket, object.Key, opts)
+		if err != nil {
+			log.Println("GET", bucket, object.Key, object.VersionID, "=>", err)
+			failedMD5 = true
+			break
+		}
+		h := md5.New()
+		if _, err := io.Copy(h, obj); err != nil {
+			log.Println("MD5 calculation error:", bucket, object.Key, object.VersionID, "=>", err)
+			failedMD5 = true
+			break
+		}
+		partsMD5Sum = append(partsMD5Sum, h.Sum(nil))
+	}
 
-			corrupted := false
-			if !multipart {
-				md5sum := fmt.Sprintf("%x", partsMD5Sum[0])
-				if md5sum != object.ETag {
-					corrupted = true
-				}
-			} else {
-				var totalMD5SumBytes []byte
-				for _, sum := range partsMD5Sum {
-					totalMD5SumBytes = append(totalMD5SumBytes, sum...)
-				}
-				s3MD5 := fmt.Sprintf("%x-%d", getMD5Sum(totalMD5SumBytes), parts)
-				if s3MD5 != object.ETag {
-					corrupted = true
-				}
-			}
+	if failedMD5 {
+		str = fmt.Sprintf("%s, %s, %s, %t\n", bucket, object.Key, getNonEmptyVersionID(object.VersionID), object.IsDeleteMarker)
+		if _, err := datawriter.WriteString(str); err != nil {
+			log.Println("Error writing object to file:", bucket, object.Key, object.VersionID, err)
+		}
+		return
+	}
 
-			if corrupted {
-				str = fmt.Sprintf("%s, %s, %s, %t\n", bucket, object.Key, getNonEmptyVersionID(object.VersionID), object.IsDeleteMarker)
-			} else {
-				if !corruptedOnly {
-					str = fmt.Sprintf("%s, %s, %s, %t\n", bucket, object.Key, getNonEmptyVersionID(object.VersionID), object.IsDeleteMarker)
-				}
-			}
-			if str != "" {
-				if _, err := datawriter.WriteString(str); err != nil {
-					log.Println("Error writing object to file:", bucket, object.Key, object.VersionID, err)
-				}
-			}
+	corrupted := false
+	if !multipart {
+		md5sum := fmt.Sprintf("%x", partsMD5Sum[0])
+		if md5sum != object.ETag {
+			corrupted = true
+		}
+	} else {
+		var totalMD5SumBytes []byte
+		for _, sum := range partsMD5Sum {
+			totalMD5SumBytes = append(totalMD5SumBytes, sum...)
+		}
+		s3MD5 := fmt.Sprintf("%x-%d", getMD5Sum(totalMD5SumBytes), parts)
+		if s3MD5 != object.ETag {
+			corrupted = true
+		}
+	}
+
+	if corrupted {
+		str = fmt.Sprintf("%s, %s, %s, %t\n", bucket, object.Key, getNonEmptyVersionID(object.VersionID), object.IsDeleteMarker)
+	} else {
+		if !corruptedOnly {
+			str = fmt.Sprintf("%s, %s, %s, %t\n", bucket, object.Key, getNonEmptyVersionID(object.VersionID), object.IsDeleteMarker)
+		}
+	}
+	if str != "" {
+		if _, err := datawriter.WriteString(str); err != nil {
+			log.Println("Error writing object to file:", bucket, object.Key, object.VersionID, err)
 		}
 	}
 }
