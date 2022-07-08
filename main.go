@@ -170,7 +170,9 @@ func main() {
 		}
 		defer csvf.Close()
 
-		lines, err := csv.NewReader(csvf).ReadAll()
+		csvReader := csv.NewReader(csvf)
+		csvReader.LazyQuotes = true
+		lines, err := csvReader.ReadAll()
 		if err != nil {
 			log.Fatal("Unable to parse file as CSV for "+inputFile, err)
 		}
